@@ -12,10 +12,13 @@ google-generativeai
 # Configuration
 python-dotenv
 
+# Tokenizer integration for the custom Gemma chat template
+transformers
+
 # The standard library covers the rest of the MVP:
 #   - sqlite3      (database layer)
 #   - dataclasses  (structured tool inputs)
 #   - datetime     (planning / review date logic)
 # Add `pydantic` here only if dataclasses prove insufficient for tool schemas.
 # Add `jinja2` only if the custom Gemma chat template is exercised outside
-# transformers (transformers already bundles Jinja2 for apply_chat_template).
+# Transformers (Transformers already bundles Jinja2 for apply_chat_template).

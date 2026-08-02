@@ -24,8 +24,8 @@ database statistics, and an execution trace in one desktop-friendly view.
 - A Gradio presentation layer with chat, task overview, statistics, trace,
   refresh, and clear-conversation controls.
 
-Daily planning, work-session logging, progress reviews, and the custom Gemma
-chat template are planned work; they are not represented as available features.
+Daily planning, work-session logging, and progress reviews are planned work;
+they are not represented as available features.
 
 ## Architecture
 
@@ -132,6 +132,87 @@ The assistant accepts Turkish or English. For example:
 For task creation and updates, the model calls the relevant tool and confirms
 the result only after the tool reports success. A project must already exist;
 task creation does not create projects implicitly.
+
+## Custom Chat Template
+
+The fine-tuned Gemma model needs a deterministic prompt format: it does not
+receive the application's Python message dictionaries directly. The custom
+template at `templates/chat_template.jinja` converts those dictionaries to
+Gemma's `<start_of_turn>` / `<end_of_turn>` format, keeps tool activity
+separate from ordinary assistant text, and avoids whitespace drift between
+training and inference.
+
+Supported message roles are `system`, `user`, `assistant`, and `tool`.
+An initial system message is embedded in the first Gemma user turn. Assistant
+`tool_calls` render as `<tool_call>` JSON blocks; consecutive `tool` messages
+are grouped in one user turn as `<tool_response>` JSON blocks. The template
+also renders optional tool schemas supplied through Transformers' `tools=`
+argument.
+
+Load the tokenizer for the fine-tuned model (or an approved Gemma base
+tokenizer), then attach the template before calling `apply_chat_template`:
+
+```python
+from pathlib import Path
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("/path/to/ayarlicazhocam-gemma")
+tokenizer.chat_template = Path("templates/chat_template.jinja").read_text(
+    encoding="utf-8"
+)
+
+messages = [
+    {"role": "system", "content": "Use tools for stored task data."},
+    {"role": "user", "content": "Gecikmiş görevler var mı?"},
+]
+prompt = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
+```
+
+For an empty conversation, current Transformers releases reject a single
+empty list before rendering. A one-item empty batch (`[[]]`) is supported when
+that behavior needs to be tested. Normal inference should begin with a user
+message.
+
+### Full tool-call example
+
+```python
+messages = [
+    {"role": "system", "content": "Use tools for stored task data."},
+    {"role": "user", "content": "Gecikmiş görevler var mı?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"function": {"name": "get_tasks", "arguments": {"overdue": True}}}
+        ],
+    },
+    {
+        "role": "tool",
+        "name": "get_tasks",
+        "tool_call_id": "call_1",
+        "content": '{"count": 0, "tasks": []}',
+    },
+    {"role": "assistant", "content": "Gecikmiş görevin yok."},
+]
+```
+
+```text
+<bos><start_of_turn>user
+<system>Use tools for stored task data.</system>
+Gecikmiş görevler var mı?<end_of_turn>
+<start_of_turn>model
+<tool_call>{"name": "get_tasks", "arguments": {"overdue": true}}</tool_call><end_of_turn>
+<start_of_turn>user
+<tool_response>{"name": "get_tasks", "content": "{\"count\": 0, \"tasks\": []}", "tool_call_id": "call_1"}</tool_response><end_of_turn>
+<start_of_turn>model
+Gecikmiş görevin yok.<end_of_turn>
+```
+
+The `<bos>` token comes from the assigned tokenizer. `add_generation_prompt=True`
+would append `<start_of_turn>model` after a final user turn when generating a
+new assistant response.
 
 ## Data integrity and tool responses
 

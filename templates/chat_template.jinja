@@ -1,0 +1,58 @@
+{#
+  AyarlaHocam Gemma chat template.
+
+  This follows Gemma's <start_of_turn>/<end_of_turn> convention.  An initial
+  system message is embedded in the first user turn because Gemma prompt
+  formats use user/model turns rather than a standalone system turn.
+#}
+{{- bos_token -}}
+{%- set system_message = none -%}
+{%- if messages and messages[0]['role'] == 'system' -%}
+  {%- set system_message = messages[0]['content'] | default('', true) | trim -%}
+{%- endif -%}
+{%- if tools is defined and tools -%}
+{{- '<start_of_turn>user\n<tools>' + (tools | tojson) + '</tools><end_of_turn>\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- set role = message['role'] -%}
+  {%- if role == 'system' -%}
+    {%- if loop.index0 != 0 -%}
+      {{- raise_exception('A system message must be the first message.') -}}
+    {%- endif -%}
+  {%- elif role == 'user' -%}
+{{- '<start_of_turn>user\n' -}}
+    {%- if loop.index0 == 1 and system_message is not none -%}
+{{- '<system>' + system_message + '</system>\n' -}}
+    {%- endif -%}
+{{- message['content'] | default('', true) | trim -}}
+{{- '<end_of_turn>\n' -}}
+  {%- elif role == 'assistant' -%}
+    {%- set assistant_content = message['content'] | default('', true) | trim -%}
+{{- '<start_of_turn>model\n' + assistant_content -}}
+    {%- for tool_call in message.get('tool_calls', []) -%}
+      {%- set function = tool_call.get('function', tool_call) -%}
+      {%- set tool_name = function.get('name', tool_call.get('name', 'unknown_tool')) -%}
+      {%- set tool_arguments = function.get('arguments', tool_call.get('arguments', {})) -%}
+{{- '<tool_call>' + ({'name': tool_name, 'arguments': tool_arguments} | tojson) + '</tool_call>' -}}
+    {%- endfor -%}
+{{- '<end_of_turn>\n' -}}
+  {%- elif role == 'tool' -%}
+    {%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}
+{{- '<start_of_turn>user\n' -}}
+    {%- endif -%}
+    {%- set tool_result = {
+      'name': message.get('name', message.get('tool_name', 'unknown_tool')),
+      'content': message['content'] | default('', true),
+      'tool_call_id': message.get('tool_call_id', none)
+    } -%}
+{{- '<tool_response>' + (tool_result | tojson) + '</tool_response>' -}}
+    {%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}
+{{- '<end_of_turn>\n' -}}
+    {%- endif -%}
+  {%- else -%}
+    {{- raise_exception('Unsupported message role: ' + role) -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<start_of_turn>model\n' -}}
+{%- endif -%}

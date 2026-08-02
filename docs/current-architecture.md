@@ -86,6 +86,42 @@ alters the database.
 The footer calls `resolve_db_path()` and displays the configured provider,
 model, and resolved SQLite database path on separate, clearly labelled lines.
 
+## Chat Template Layer
+
+The fine-tuned Gemma model uses a standalone serialization layer that is kept
+outside the runtime backend:
+
+```text
+message dictionaries
+        |
+        v
+templates/chat_template.jinja
+        |
+        v
+Tokenizer.apply_chat_template()
+        |
+        v
+Gemma prompt
+```
+
+`templates/chat_template.jinja` follows Gemma's
+`<start_of_turn>…<end_of_turn>` convention. It accepts `system`, `user`,
+`assistant`, and `tool` messages. Because Gemma prompts have user/model turns,
+an initial system message is embedded in the first user turn rather than emitted
+as an unsupported standalone turn.
+
+Assistant function requests are serialized as JSON inside `<tool_call>` blocks.
+Tool results remain distinguishable from assistant text as JSON inside
+`<tool_response>` blocks, grouped within a user turn when there are consecutive
+tool results. The optional `tools` argument is rendered in a `<tools>` block.
+
+The layer adds no application business logic and does not call the database,
+agent, providers, tools, or Gradio UI. Consumers load a Gemma tokenizer,
+assign the template string to `tokenizer.chat_template`, and call
+`tokenizer.apply_chat_template(messages, ...)`. The offline integration tests
+use a local fast tokenizer to exercise that exact Transformers API without
+requiring access to a gated Gemma checkpoint.
+
 ## Agent and providers
 
 `agent/orchestrator.py` implements a provider-independent, bounded tool loop.
@@ -145,5 +181,5 @@ provider tests. These tests use temporary databases or injected provider clients
 and do not require a live API key.
 
 The remaining roadmap work is intentionally outside the completed UI scope:
-daily planning, work-session logging, progress reviews, habits, the custom
-Gemma template, broader hallucination scenarios, and deployment documentation.
+daily planning, work-session logging, progress reviews, habits, broader
+hallucination scenarios, and deployment documentation.
