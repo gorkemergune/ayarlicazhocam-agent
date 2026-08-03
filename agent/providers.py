@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from typing import Any
 
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+DEFAULT_OLLAMA_MODEL = "ayarlicazhocam:latest"
 
 # --- Stable error codes (independent of any SDK) ---------------------------
 ERR_CONFIG = "CONFIG_ERROR"
@@ -110,6 +112,16 @@ _GROQ_ERROR_NAMES: dict[str, str] = {
     "APIConnectionError": ERR_PROVIDER_UNAVAILABLE,
     "InternalServerError": ERR_PROVIDER_UNAVAILABLE,
     "NotFoundError": ERR_MODEL_UNAVAILABLE,
+}
+
+# Ollama runs locally. ``ResponseError`` is intentionally left out so that
+# ``_map_sdk_error`` falls through to its ``status_code`` (e.g. 404 -> model
+# unavailable). Only connection/timeout failures are mapped by class name.
+_OLLAMA_ERROR_NAMES: dict[str, str] = {
+    "ConnectError": ERR_PROVIDER_UNAVAILABLE,
+    "ConnectionError": ERR_PROVIDER_UNAVAILABLE,
+    "TimeoutException": ERR_TIMEOUT,
+    "ReadTimeout": ERR_TIMEOUT,
 }
 
 _GEMINI_ERROR_NAMES: dict[str, str] = {
@@ -252,6 +264,40 @@ class GeminiProvider(Provider):
 
     name = "gemini"
 
+    # JSON-Schema keywords the canonical (OpenAI-style) tool schemas use that
+    # Gemini's ``Schema`` proto does not accept. Groq consumes the schemas as-is;
+    # Gemini requires them stripped, so the translation lives here in the adapter
+    # rather than polluting the provider-neutral schemas in ``tools/schemas.py``.
+    _UNSUPPORTED_SCHEMA_KEYS: frozenset[str] = frozenset(
+        {
+            "additionalProperties",
+            "pattern",
+            "minimum",
+            "maximum",
+            "minItems",
+            "maxItems",
+            "minLength",
+            "maxLength",
+        }
+    )
+
+    @classmethod
+    def _sanitize_schema(cls, obj: Any) -> Any:
+        """Recursively drop keys Gemini's Schema proto rejects.
+
+        Returns a new structure; the input (the shared canonical schema) is
+        never mutated.
+        """
+        if isinstance(obj, dict):
+            return {
+                key: cls._sanitize_schema(value)
+                for key, value in obj.items()
+                if key not in cls._UNSUPPORTED_SCHEMA_KEYS
+            }
+        if isinstance(obj, list):
+            return [cls._sanitize_schema(item) for item in obj]
+        return obj
+
     def __init__(
         self,
         model: str | None = None,
@@ -330,7 +376,11 @@ class GeminiProvider(Provider):
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
     ) -> ProviderResponse:
         system_instruction, contents = self._to_contents(messages)
-        gem_tools = [{"function_declarations": tools}] if tools else None
+        gem_tools = (
+            [{"function_declarations": self._sanitize_schema(tools)}]
+            if tools
+            else None
+        )
 
         start = time.perf_counter()
         try:
@@ -388,6 +438,208 @@ class GeminiProvider(Provider):
         )
 
 
+class OllamaProvider(Provider):
+    """Local Ollama provider (OpenAI-style tool calling, fully offline).
+
+    Runs against a local Ollama server (default ``http://localhost:11434``), so
+    there are no API keys and no rate limits. Uses the same canonical message
+    and tool-schema format as the other providers; only the transport differs.
+    """
+
+    name = "ollama"
+
+    def __init__(
+        self,
+        model: str | None = None,
+        host: str | None = None,
+        *,
+        client: Any | None = None,
+    ) -> None:
+        self._model = model or os.environ.get("OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL
+        if client is not None:  # injected for tests
+            self._client = client
+            return
+        try:
+            import ollama
+        except ImportError as exc:
+            raise ProviderError(
+                "The 'ollama' package is not installed.", code=ERR_CONFIG
+            ) from exc
+        host = host or os.environ.get("OLLAMA_HOST")
+        self._client = ollama.Client(host=host) if host else ollama.Client()
+
+    # -- text-form tool-call recovery ---------------------------------------
+    # Some models (notably small fine-tunes) emit a tool call as TEXT in the
+    # content instead of via the native tool_calls field — e.g.
+    #   <tool_call>{"name": "create_task", "arguments": {...}}</tool_call>
+    # or a bare {"name": "...", "parameters"/"arguments": {...}} object, often
+    # slightly malformed (`"parameters=` instead of `"parameters":`). Without
+    # recovery these are treated as a final answer and no tool ever runs. This
+    # parser rescues those calls so the tool loop still works.
+
+    @staticmethod
+    def _json_like_objects(text: str) -> list[str]:
+        """Return balanced-brace ``{...}`` substrings (handles nesting)."""
+        objects: list[str] = []
+        depth = 0
+        start: int | None = None
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}" and depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objects.append(text[start : i + 1])
+                    start = None
+        return objects
+
+    @staticmethod
+    def _tolerant_json(fragment: str) -> Any:
+        """Parse JSON, tolerating the common ``"key=`` fine-tune malformation."""
+        candidates = [
+            fragment,
+            fragment.replace('parameters=', 'parameters":').replace(
+                'arguments=', 'arguments":'
+            ),
+        ]
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return None
+
+    @classmethod
+    def _extract_text_tool_calls(cls, text: str | None) -> list[ToolCall]:
+        """Recover tool calls a model emitted as text. Empty list if none."""
+        if not text:
+            return []
+        # Prefer explicit <tool_call>...</tool_call> blocks, else scan for any
+        # JSON-like object that names a function.
+        blocks = re.findall(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL
+        )
+        fragments = blocks or [
+            frag for frag in cls._json_like_objects(text) if '"name"' in frag
+        ]
+        calls: list[ToolCall] = []
+        for i, fragment in enumerate(fragments):
+            obj = cls._tolerant_json(fragment)
+            if not isinstance(obj, dict):
+                continue
+            name = obj.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            args = obj.get("arguments")
+            if not isinstance(args, dict):
+                args = obj.get("parameters")
+            if not isinstance(args, dict):
+                args = {}
+            calls.append(ToolCall(id=f"ollama_text_{name}_{i}", name=name, arguments=args))
+        return calls
+
+    @staticmethod
+    def _to_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert canonical OpenAI-style messages into Ollama chat messages.
+
+        Ollama expects tool-call ``arguments`` as an object (not a JSON string),
+        so assistant tool calls are re-parsed on the way through.
+        """
+        out: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role in ("system", "user"):
+                out.append({"role": role, "content": message.get("content", "") or ""})
+            elif role == "assistant":
+                entry: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": message.get("content", "") or "",
+                }
+                tool_calls: list[dict[str, Any]] = []
+                for tc in message.get("tool_calls", []) or []:
+                    fn = tc.get("function", tc)
+                    raw = fn.get("arguments")
+                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    tool_calls.append(
+                        {"function": {"name": fn.get("name"), "arguments": args}}
+                    )
+                if tool_calls:
+                    entry["tool_calls"] = tool_calls
+                out.append(entry)
+            elif role == "tool":
+                entry = {"role": "tool", "content": message.get("content", "") or ""}
+                if message.get("name"):
+                    entry["tool_name"] = message["name"]
+                out.append(entry)
+        return out
+
+    def generate(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    ) -> ProviderResponse:
+        tool_param = (
+            [{"type": "function", "function": schema} for schema in tools]
+            if tools
+            else None
+        )
+        start = time.perf_counter()
+        try:
+            response = self._client.chat(
+                model=self._model,
+                messages=self._to_ollama(messages),
+                tools=tool_param,
+            )
+        except Exception as exc:
+            raise _map_sdk_error(exc, _OLLAMA_ERROR_NAMES, "Ollama") from exc
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        try:
+            message = response.message
+            calls: list[ToolCall] = []
+            for i, tc in enumerate(getattr(message, "tool_calls", None) or []):
+                fn = tc.function
+                raw = fn.arguments
+                arguments: Any = dict(raw) if isinstance(raw, dict) else raw
+                calls.append(
+                    ToolCall(id=f"ollama_{fn.name}_{i}", name=fn.name, arguments=arguments)
+                )
+            usage = self._parse_usage(response)
+            text = getattr(message, "content", None) or None
+        except (AttributeError, TypeError) as exc:
+            raise ProviderError(
+                f"Malformed Ollama response: {exc}", code=ERR_MALFORMED_RESPONSE
+            ) from exc
+
+        # Fallback: if the model produced no native tool calls but wrote one as
+        # text, recover it so the tool loop still runs. The recovered call is a
+        # tool request, not a final answer, so the raw text is dropped.
+        if not calls and text:
+            recovered = self._extract_text_tool_calls(text)
+            if recovered:
+                calls = recovered
+                text = None
+
+        return ProviderResponse(
+            text=text,
+            tool_calls=calls,
+            usage=usage,
+            latency_ms=latency_ms,
+            model=self._model,
+        )
+
+    @staticmethod
+    def _parse_usage(response: Any) -> Usage | None:
+        prompt = getattr(response, "prompt_eval_count", None)
+        completion = getattr(response, "eval_count", None)
+        if prompt is None and completion is None:
+            return None
+        total = (prompt or 0) + (completion or 0) if (prompt or completion) else None
+        return Usage(
+            prompt_tokens=prompt, completion_tokens=completion, total_tokens=total
+        )
+
+
 def get_provider(name: str | None = None, **kwargs: Any) -> Provider:
     """Instantiate the configured provider.
 
@@ -408,6 +660,8 @@ def get_provider(name: str | None = None, **kwargs: Any) -> Provider:
         return GroqProvider(**kwargs)
     if provider_name in ("gemini", "google"):
         return GeminiProvider(**kwargs)
+    if provider_name in ("ollama", "local"):
+        return OllamaProvider(**kwargs)
     raise ProviderError(
         f"Unknown MODEL_PROVIDER: {provider_name!r}.", code=ERR_CONFIG
     )

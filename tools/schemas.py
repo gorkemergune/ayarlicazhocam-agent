@@ -42,7 +42,12 @@ CREATE_TASK_SCHEMA: dict[str, Any] = {
             },
             "project_id": {
                 "type": "integer",
-                "description": "Id of an existing project to attach the task to.",
+                "description": (
+                    "Optional. Id of an EXISTING project to attach the task to. "
+                    "Omit this field entirely unless the user explicitly names a "
+                    "project that already exists — never guess or invent a "
+                    "project id."
+                ),
             },
             "priority": {
                 "type": "string",

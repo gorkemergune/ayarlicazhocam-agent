@@ -8,6 +8,9 @@ gradio
 # Model providers
 groq
 google-generativeai
+# Local, offline provider (no API key, no rate limits). Requires a running
+# Ollama server: https://ollama.com  (e.g. `ollama pull ayarlicazhocam`).
+ollama
 
 # Configuration
 python-dotenv

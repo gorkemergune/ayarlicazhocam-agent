@@ -89,6 +89,21 @@ def test_reject_bool_minutes(service):
         service.create_task("t", estimated_minutes=True)
 
 
+def test_coerce_string_and_float_minutes(service):
+    # LLMs often send numbers as strings or floats; these are coerced to int.
+    t1 = service.create_task("a", estimated_minutes="30")
+    assert t1["estimated_minutes"] == 30
+    t2 = service.create_task("b", estimated_minutes=45.0)
+    assert t2["estimated_minutes"] == 45
+
+
+def test_reject_non_numeric_and_fractional_minutes(service):
+    with pytest.raises(ValidationError):
+        service.create_task("c", estimated_minutes="abc")
+    with pytest.raises(ValidationError):
+        service.create_task("d", estimated_minutes=30.5)
+
+
 def test_reject_nonexistent_project(service):
     with pytest.raises(ProjectNotFoundError):
         service.create_task("t", project_id=999)

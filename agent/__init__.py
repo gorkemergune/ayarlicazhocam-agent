@@ -28,6 +28,7 @@ from .prompts import SYSTEM_PROMPT
 from .providers import (
     GeminiProvider,
     GroqProvider,
+    OllamaProvider,
     Provider,
     ProviderError,
     ProviderResponse,
@@ -53,4 +54,5 @@ __all__ = [
     "ProviderError",
     "GroqProvider",
     "GeminiProvider",
+    "OllamaProvider",
 ]

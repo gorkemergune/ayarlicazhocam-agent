@@ -134,7 +134,22 @@ class TaskService:
         if value is None:
             return None
         # bool is a subclass of int; reject it explicitly.
-        if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, bool):
+            raise ValidationError(f"{field_name} must be an integer >= 0.")
+        # LLMs frequently send numbers as strings ("30") or floats (30.0).
+        # Coerce those to a non-negative int; reject anything non-numeric.
+        if isinstance(value, str):
+            text = value.strip()
+            if not text.lstrip("-").isdigit():
+                raise ValidationError(f"{field_name} must be an integer >= 0.")
+            value = int(text)
+        elif isinstance(value, float):
+            if not value.is_integer():
+                raise ValidationError(
+                    f"{field_name} must be a whole number of minutes."
+                )
+            value = int(value)
+        elif not isinstance(value, int):
             raise ValidationError(f"{field_name} must be an integer >= 0.")
         if value < 0:
             raise ValidationError(f"{field_name} must be >= 0.")

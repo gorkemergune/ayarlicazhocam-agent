@@ -132,11 +132,18 @@ def test_parameterized_query_roundtrip(db):
     assert "projects" in _table_names(db)
 
 
-def test_default_db_path_used_when_env_missing(tmp_path, monkeypatch):
-    monkeypatch.delenv("DATABASE_PATH", raising=False)
-    monkeypatch.chdir(tmp_path)  # no stray .env here for dotenv to load
+def test_relative_db_path_anchored_to_project_root(tmp_path, monkeypatch):
+    # A relative DATABASE_PATH must resolve to the project root, NOT the current
+    # working directory, so launching from anywhere uses the same database file.
+    monkeypatch.setenv("DATABASE_PATH", "data/ayarlicazhocam.db")
+    monkeypatch.chdir(tmp_path)  # launch from an unrelated directory
     close_connection()
     path = database.resolve_db_path()
     assert path.endswith("ayarlicazhocam.db")
-    assert Path("data").exists()  # parent dir auto-created
+    assert Path(path).is_absolute()
+    assert Path(path).parent.name == "data"
+    assert Path(path).parent.exists()  # parent dir auto-created
+    # Crucially: it was NOT created relative to the (changed) CWD.
+    assert str(tmp_path) not in path
+    assert not (tmp_path / "data").exists()
     close_connection()

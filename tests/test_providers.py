@@ -24,6 +24,7 @@ from agent.providers import (
     ERR_TIMEOUT,
     GeminiProvider,
     GroqProvider,
+    OllamaProvider,
     ProviderError,
     Usage,
     get_provider,
@@ -270,6 +271,38 @@ def test_gemini_tool_call_and_text_parsing():
     assert resp.model == "gm"
 
 
+def test_gemini_sanitizes_unsupported_schema_keys():
+    # Gemini's Schema proto rejects keys like additionalProperties/pattern/minimum
+    # that the canonical OpenAI-style schemas carry. The adapter must strip them
+    # recursively without mutating the input.
+    canonical = [
+        {
+            "name": "create_task",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "minLength": 1},
+                    "due_date": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+                    "minutes": {"type": "integer", "minimum": 0, "maximum": 999},
+                },
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    cleaned = GeminiProvider._sanitize_schema(canonical)
+    params = cleaned[0]["parameters"]
+    assert "additionalProperties" not in params
+    assert "pattern" not in params["properties"]["due_date"]
+    assert "minimum" not in params["properties"]["minutes"]
+    assert "minLength" not in params["properties"]["title"]
+    # Supported structure is preserved.
+    assert params["properties"]["title"]["type"] == "string"
+    assert params["required"] == ["title"]
+    # Input is not mutated.
+    assert "additionalProperties" in canonical[0]["parameters"]
+
+
 def test_gemini_text_only_response():
     text_part = SimpleNamespace(function_call=None, text="plain answer")
     model = FakeGeminiModel(response=_gemini_response([text_part]))
@@ -302,3 +335,152 @@ def test_gemini_error_mapping_by_name(exc, code):
     with pytest.raises(ProviderError) as raised:
         GeminiProvider(client=model).generate([{"role": "user", "content": "q"}], None)
     assert raised.value.code == code
+
+
+# --- Ollama: local provider -------------------------------------------------
+
+class FakeOllamaClient:
+    """Mimics ollama.Client: captures chat() kwargs, returns a scripted reply."""
+
+    def __init__(self, reply=None, error=None):
+        self._reply = reply
+        self._error = error
+        self.captured = None
+
+    def chat(self, **kwargs):
+        self.captured = kwargs
+        if self._error is not None:
+            raise self._error
+        return self._reply
+
+
+def _ollama_reply(content=None, tool_calls=None, prompt=None, completion=None):
+    fn_calls = []
+    for name, args in tool_calls or []:
+        fn_calls.append(SimpleNamespace(function=SimpleNamespace(name=name, arguments=args)))
+    message = SimpleNamespace(content=content, tool_calls=fn_calls or None)
+    return SimpleNamespace(
+        message=message, prompt_eval_count=prompt, eval_count=completion
+    )
+
+
+def test_ollama_tool_call_and_usage_parsing():
+    client = FakeOllamaClient(
+        reply=_ollama_reply(
+            tool_calls=[("create_task", {"title": "x"})], prompt=12, completion=4
+        )
+    )
+    resp = OllamaProvider(model="ayarlicazhocam:latest", client=client).generate(
+        [{"role": "user", "content": "add x"}], [{"name": "create_task"}]
+    )
+    assert resp.tool_calls[0].name == "create_task"
+    assert resp.tool_calls[0].arguments == {"title": "x"}
+    assert resp.usage == Usage(prompt_tokens=12, completion_tokens=4, total_tokens=16)
+    assert resp.model == "ayarlicazhocam:latest"
+    # Tools are wrapped in the OpenAI function envelope for Ollama.
+    assert client.captured["tools"] == [
+        {"type": "function", "function": {"name": "create_task"}}
+    ]
+
+
+def test_ollama_text_only_response():
+    client = FakeOllamaClient(reply=_ollama_reply(content="plain answer"))
+    resp = OllamaProvider(client=client).generate(
+        [{"role": "user", "content": "q"}], None
+    )
+    assert resp.text == "plain answer"
+    assert resp.tool_calls == []
+    assert client.captured["tools"] is None
+
+
+def test_ollama_message_conversion_reparses_tool_arguments():
+    # Assistant tool_calls carry JSON-string arguments; Ollama needs objects.
+    messages = [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "get_tasks", "arguments": '{"overdue": true}'}}
+            ],
+        },
+        {"role": "tool", "name": "get_tasks", "content": '{"count": 0}'},
+    ]
+    converted = OllamaProvider._to_ollama(messages)
+    assert converted[0] == {"role": "system", "content": "be helpful"}
+    assert converted[2]["tool_calls"][0]["function"]["arguments"] == {"overdue": True}
+    assert converted[3] == {"role": "tool", "content": '{"count": 0}', "tool_name": "get_tasks"}
+
+
+def test_ollama_connection_error_is_provider_unavailable():
+    err = type("ConnectError", (Exception,), {})()
+    client = FakeOllamaClient(error=err)
+    with pytest.raises(ProviderError) as raised:
+        OllamaProvider(client=client).generate([{"role": "user", "content": "q"}], None)
+    assert raised.value.code == ERR_PROVIDER_UNAVAILABLE
+
+
+def test_ollama_recovers_malformed_text_tool_call():
+    # Some fine-tunes emit the call as (malformed) text instead of a native
+    # tool_calls field. The provider must recover it so the tool loop runs.
+    bad = (
+        '{"name":"create_task","parameters={"priority": "high", '
+        '"title": "Finish README"}}'
+    )
+    client = FakeOllamaClient(reply=_ollama_reply(content=bad))
+    resp = OllamaProvider(client=client).generate(
+        [{"role": "user", "content": "add it"}], [{"name": "create_task"}]
+    )
+    assert [c.name for c in resp.tool_calls] == ["create_task"]
+    assert resp.tool_calls[0].arguments == {"priority": "high", "title": "Finish README"}
+    # The raw text is dropped: it was a tool request, not a final answer.
+    assert resp.text is None
+
+
+def test_ollama_recovers_tool_call_tag_form():
+    text = 'Sure!<tool_call>{"name": "get_tasks", "arguments": {"status": "todo"}}</tool_call>'
+    client = FakeOllamaClient(reply=_ollama_reply(content=text))
+    resp = OllamaProvider(client=client).generate(
+        [{"role": "user", "content": "list"}], [{"name": "get_tasks"}]
+    )
+    assert resp.tool_calls[0].name == "get_tasks"
+    assert resp.tool_calls[0].arguments == {"status": "todo"}
+
+
+def test_ollama_plain_text_is_not_mistaken_for_a_tool_call():
+    client = FakeOllamaClient(reply=_ollama_reply(content="You have 6 tasks."))
+    resp = OllamaProvider(client=client).generate(
+        [{"role": "user", "content": "how many?"}], None
+    )
+    assert resp.tool_calls == []
+    assert resp.text == "You have 6 tasks."
+
+
+def test_ollama_native_tool_calls_take_precedence_over_text():
+    # If native tool_calls exist, the text fallback must not run.
+    client = FakeOllamaClient(
+        reply=_ollama_reply(
+            content='{"name": "get_tasks", "arguments": {}}',
+            tool_calls=[("create_task", {"title": "x"})],
+        )
+    )
+    resp = OllamaProvider(client=client).generate(
+        [{"role": "user", "content": "go"}], [{"name": "create_task"}]
+    )
+    assert [c.name for c in resp.tool_calls] == ["create_task"]
+
+
+def test_get_provider_selects_ollama(monkeypatch):
+    class DummyOllama(P.Provider):
+        name = "ollama"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, messages, tools):
+            return P.ProviderResponse(text="x")
+
+    monkeypatch.setattr(P, "OllamaProvider", DummyOllama)
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+    assert get_provider().name == "ollama"
